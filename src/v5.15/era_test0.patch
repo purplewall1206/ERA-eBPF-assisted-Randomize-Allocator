@@ -1,0 +1,535 @@
+From 15233595b1c3f87599972b0d9c85d6779f0a8380 Mon Sep 17 00:00:00 2001
+From: purplewall1206 <wzc@smail.nju.edu.cn>
+Date: Wed, 10 Aug 2022 20:09:08 +0800
+Subject: [PATCH 3/3] era test0
+
+---
+ samples/bpf/ERA_test0.bpf.c | 345 ++++++++++++++++++++++++++++++++++++
+ samples/bpf/ERA_test0.c     | 115 ++++++++++++
+ samples/bpf/Makefile        |  11 +-
+ 4 files changed, 550 insertions(+), 4 deletions(-)
+ create mode 100644 samples/bpf/ERA_test0.bpf.c
+ create mode 100644 samples/bpf/ERA_test0.c
+
+
+diff --git a/samples/bpf/ERA_test0.bpf.c b/samples/bpf/ERA_test0.bpf.c
+new file mode 100644
+index 000000000..cb1ef8ab1
+--- /dev/null
++++ b/samples/bpf/ERA_test0.bpf.c
+@@ -0,0 +1,345 @@
++#include "vmlinux.h"
++#include <bpf/bpf_helpers.h>
++#include <bpf/bpf_tracing.h>
++#include <bpf/bpf_core_read.h>
++
++char LICENSE[] SEC("license") = "Dual BSD/GPL";
++
++// 8, 16, 32, 64, 96, 128, 192, 256, 512, 1024, 2048, 4096, 8192
++// 0,  1,  2,  3,  4,   5,   6,   7,   8,    9,   10,   11,   12
++// ebpf not support pointer arithimetic, a.k.a. array.
++#define MAX_CACHES 13
++
++u64 idx_to_size(u32 idx) {
++    if (idx == 0) {
++        return 8;
++    } else if (idx == 1) {
++        return 16;
++    } else if (idx == 2) {
++        return 32;
++    } else if (idx == 3) {
++        return 64;
++    } else if (idx == 4) {
++        return 96;
++    } else if (idx == 5) {
++        return 128;
++    } else if (idx == 6) {
++        return 192;
++    } else if (idx == 7) {
++        return 256;
++    } else if (idx == 8) {
++        return 512;
++    } else if (idx == 9) {
++        return 1024;
++    } else if (idx == 10) {
++        return 2048;
++    } else if (idx == 11) {
++        return 4096;
++    } else if (idx == 12) {
++        return 8192;
++    } else {
++        return 10000;
++    }
++}
++
++u32 size_to_idx(u64 size) {
++    if (size <= 8) {
++        return 0;
++    } else if (8 < size && size <= 16) {
++        return 1;
++    } else if (16 < size && size <= 32) {
++        return 2;
++    } else if (32 < size && size <= 64) {
++        return 3;
++    } else if (64 < size && size <= 96) {
++        return 4;
++    } else if (96 < size && size <= 128) {
++        return 5;
++    } else if (128 < size && size <= 192) {
++        return 6;
++    } else if (192 < size && size <= 256) {
++        return 7;
++    } else if (256 < size && size <= 512) {
++        return 8;
++    } else if (512 < size && size <= 1024) {
++        return 9;
++    } else if (1024 < size && size <= 2048) {
++        return 10;
++    } else if (2048 < size && size <= 4096) {
++        return 11;
++    } else if (4096 < size && size <= 8192) {
++        return 12;
++    } else {
++        return 13;
++    }
++}
++
++
++struct {
++    __uint(type, BPF_MAP_TYPE_HASH);
++    __uint(max_entries, 40960);
++    __type(key, u32);
++    __type(value, u32);
++} allocs SEC(".maps");
++
++// struct {
++// 	__uint(type, BPF_MAP_TYPE_ARRAY);
++// 	__type(key, u32); /* class; u32 required */
++// 	__type(value, u32); /* count of mads read */
++// 	__uint(max_entries, 100); /* Room for all Classes */
++// } allocs SEC(".maps");
++
++
++struct {
++    __uint(type, BPF_MAP_TYPE_HASH);
++    __uint(max_entries, 40960);
++    __type(key, u64);
++    __type(value, u64);
++} addrs SEC(".maps");
++
++SEC("kprobe/single_open")
++int BPF_KPROBE(prog1)
++{
++    u32 pid = bpf_get_current_pid_tgid();
++    u32 val = 1;
++    int err = 0;
++    err = bpf_map_update_elem(&allocs, &pid, &val, BPF_ANY);
++    if (err < 0) {
++        bpf_printk("single_open start: update map failed %d\n", err);
++        return err;
++    }
++    // bpf_printk("single_open start raise the flag pid:%u\n", pid);
++
++    return 0;
++}
++
++SEC("kretprobe/single_open")
++int BPF_KRETPROBE(prog2)
++{
++    u32 pid = bpf_get_current_pid_tgid();
++    int err = 0;
++    u32* pval = NULL;
++    u32 val = 0;
++    pval = bpf_map_lookup_elem(&allocs, &pid);
++    if (pval) {
++        // bpf_printk("single_open end lower the flag pid:%u\n", pid);
++        // err = bpf_map_update_elem(&alloc_flag, &pid, &val, BPF_ANY);
++        err = bpf_map_delete_elem(&allocs, &pid);
++        if (err < 0) {
++            bpf_printk("single_open end: delete map failed %d  %u  %u\n", err, pid, *pval);
++            return err;
++        }
++    } else {
++        bpf_printk("single_open end bad thing happens pid:%d  *pval:%u\n", pid, *pval);
++    }
++
++    return 0;
++}
++
++
++
++int allocation(u64 alloc_size, u32 alloc_flag, u32 pid)
++{
++    u32 *pval = NULL;
++    pval = bpf_map_lookup_elem(&allocs, &pid);
++    if (pval) {
++        // bpf_printk("allocation trigger: pid:%u,  %lx  %u\n", pid, alloc_size, *pval);
++        return 1;
++    } else {
++        return -1;
++    }
++    return 0;
++}
++
++u64 random_cache(u64 alloc_size, u64 rand) 
++{
++    u32 idx = size_to_idx(alloc_size);
++    u32 remain_caches = MAX_CACHES - 1 - idx;
++    if (remain_caches == 0) {
++        return alloc_size;
++    }
++    idx = idx + 1 + (rand % remain_caches);
++
++    return idx_to_size(idx);
++}
++
++u64 random_offset(u64 addr, u64 remain_area, u64 rand)
++{
++    remain_area = rand % remain_area;  // < remain_area;
++    remain_area = remain_area & 0xfffffff8;
++    return addr + remain_area;
++}
++
++
++SEC("kprobe/__kmalloc")
++int BPF_KPROBE(prog3)
++{
++    u64 alloc_size = ctx->di;
++    u32 alloc_flag = ctx->si;
++    u32 pid = bpf_get_current_pid_tgid();
++    int err = 0;
++    err = allocation(alloc_size, alloc_flag, pid);
++    if (err < 0) {
++        return -1;
++    } else {
++        u64 rand = bpf_get_prandom_u32();
++        u64 new_cache = random_cache(alloc_size, rand);
++
++        u64 allocated_addr = bpf_kmalloc(new_cache, alloc_flag);
++
++        u64 new_addr = random_offset(allocated_addr, (new_cache - alloc_size), rand);
++        // bpf_printk("**rand cache*** %lu  %lu\n", alloc_size, new_cache);
++        // bpf_printk("**rand offset** %lx  %lx\n", allocated_addr, new_addr);
++        
++        err = bpf_map_update_elem(&addrs, &new_addr, &allocated_addr, BPF_ANY);
++        if (err < 0) {
++            bpf_printk("__kmalloc update failed %d\n", err);
++        }
++        err = bpf_override_return(ctx, new_addr);
++        if (err != 0) {
++            bpf_printk("__kmalloc replace failed %d\n", err);
++        }
++        // bpf_printk("__kmalloc replaced\n");
++    }
++    
++    return 0;
++}
++
++SEC("kprobe/kmem_cache_alloc_trace")
++int BPF_KPROBE(prog4)
++{
++    u64 alloc_size = ctx->dx;
++    u32 alloc_flag = ctx->si;
++    u32 pid = bpf_get_current_pid_tgid();
++    int err = 0;
++    err = allocation(alloc_size, alloc_flag, pid);
++    if (err < 0) {
++        return -1;
++    } else {
++        u64 rand = bpf_get_prandom_u32();
++        u64 new_cache = random_cache(alloc_size, rand);
++
++        u64 allocated_addr = bpf_kmalloc(new_cache, alloc_flag);
++
++        u64 new_addr = random_offset(allocated_addr, (new_cache - alloc_size), rand);
++        // bpf_printk("**rand cache*** %lu  %lu\n", alloc_size, new_cache);
++        // bpf_printk("**rand offset** %lx  %lx\n", allocated_addr, new_addr);
++        
++        err = bpf_map_update_elem(&addrs, &new_addr, &allocated_addr, BPF_ANY);
++        if (err < 0) {
++            bpf_printk("kmem_cache_alloc_trace update failed %d\n", err);
++        }
++        err = bpf_override_return(ctx, new_addr);
++        if (err != 0) {
++            bpf_printk("kmem_cache_alloc_trace replace failed %d\n", err);
++        }
++        // bpf_printk("kmem_cache_alloc_trace replaced\n");
++    }
++    
++    return 0;
++}
++
++SEC("kprobe/kfree")
++int BPF_KPROBE(prog5)
++{
++    u64 addr = ctx->di;
++    int err = 0;
++    u64 *pval = bpf_map_lookup_elem(&addrs, &addr);
++    if (pval) {
++        bpf_kfree((void *)*pval);
++        err = bpf_map_delete_elem(&addrs, &addr);
++        if (err < 0) {
++            bpf_printk("kfree delete failed %d\n", err);
++        }
++        bpf_override_return(ctx, 0);
++        if (err != 0) {
++            bpf_printk("kfree replace failed %d\n", err);
++        }
++        // bpf_printk("kfree: %lx  %lx\n", addr, (u64)*pval);
++    }
++    return 0;
++}
++
++
++
++
++
++SEC("kprobe/kernfs_fop_open")
++int BPF_KPROBE(prog6)
++{
++    u32 pid = bpf_get_current_pid_tgid();
++    u32 val = 1;
++    int err = 0;
++    err = bpf_map_update_elem(&allocs, &pid, &val, BPF_ANY);
++    if (err < 0) {
++        bpf_printk("kernfs_fop_open start: update map failed %d\n", err);
++        return err;
++    }
++    bpf_printk("kernfs_fop_open start raise the flag pid:%u\n", pid);
++
++    return 0;
++}
++
++SEC("kretprobe/kernfs_fop_open")
++int BPF_KRETPROBE(prog7)
++{
++    u32 pid = bpf_get_current_pid_tgid();
++    int err = 0;
++    u32* pval = NULL;
++    u32 val = 0;
++    pval = bpf_map_lookup_elem(&allocs, &pid);
++    if (pval) {
++        bpf_printk("kernfs_fop_open end lower the flag pid:%u\n", pid);
++        // err = bpf_map_update_elem(&alloc_flag, &pid, &val, BPF_ANY);
++        err = bpf_map_delete_elem(&allocs, &pid);
++        if (err < 0) {
++            bpf_printk("kernfs_fop_open end: delete map failed %d  %u  %u\n", err, pid, *pval);
++            return err;
++        }
++    } else {
++        bpf_printk("kernfs_fop_open end bad thing happens pid:%d  *pval:%u\n", pid, *pval);
++    }
++
++    return 0;
++}
++
++
++
++// SEC("kprobe/ext4_htree_store_dirent")
++// int BPF_KPROBE(prog8)
++// {
++//     u32 pid = bpf_get_current_pid_tgid();
++//     u32 val = 1;
++//     int err = 0;
++//     err = bpf_map_update_elem(&allocs, &pid, &val, BPF_ANY);
++//     if (err < 0) {
++//         bpf_printk("ext4_htree_store_dirent start: update map failed %d\n", err);
++//         return err;
++//     }
++//     // bpf_printk("ext4_htree_store_dirent start raise the flag pid:%u\n", pid);
++
++//     return 0;
++// }
++
++// SEC("kretprobe/ext4_htree_store_dirent")
++// int BPF_KRETPROBE(prog9)
++// {
++//     u32 pid = bpf_get_current_pid_tgid();
++//     int err = 0;
++//     u32* pval = NULL;
++//     u32 val = 0;
++//     pval = bpf_map_lookup_elem(&allocs, &pid);
++//     if (pval) {
++//         // bpf_printk("ext4_htree_store_dirent end lower the flag pid:%u\n", pid);
++//         // err = bpf_map_update_elem(&alloc_flag, &pid, &val, BPF_ANY);
++//         err = bpf_map_delete_elem(&allocs, &pid);
++//         if (err < 0) {
++//             bpf_printk("ext4_htree_store_dirent end: delete map failed %d  %u  %u\n", err, pid, *pval);
++//             return err;
++//         }
++//     } else {
++//         bpf_printk("ext4_htree_store_dirent end bad thing happens pid:%d  *pval:%u\n", pid, *pval);
++//     }
++
++//     return 0;
++// }
+\ No newline at end of file
+diff --git a/samples/bpf/ERA_test0.c b/samples/bpf/ERA_test0.c
+new file mode 100644
+index 000000000..b5f42b238
+--- /dev/null
++++ b/samples/bpf/ERA_test0.c
+@@ -0,0 +1,115 @@
++#include <stdio.h>
++#include <unistd.h>
++#include <signal.h>
++#include <string.h>
++#include <errno.h>
++#include <sys/resource.h>
++#include <bpf/libbpf.h>
++#include <fcntl.h>
++// #include "kmalloc_ret.skel.h"
++
++static int libbpf_print_fn(enum libbpf_print_level level, const char *format, va_list args)
++{
++	return vfprintf(stderr, format, args);
++}
++
++static volatile sig_atomic_t stop;
++
++static void sig_int(int signo)
++{
++	stop = 1;
++}
++
++
++
++int main(int argc, char **argv)
++{
++    struct bpf_link *links[2];
++	struct bpf_program *prog;
++	struct bpf_object *obj;
++	char filename[256];
++	int map_fd, i, j = 0;
++	__u64 key, next_key, val;
++	int trace_fd;
++	
++	trace_fd = open("/sys/kernel/debug/tracing/trace_pipe", O_RDONLY, 0);
++	if (trace_fd < 0) {
++		printf("cannot open trace_pipe %d\n", trace_fd);
++		return trace_fd;
++	}
++
++    snprintf(filename, sizeof(filename), "%s.bpf.o", argv[0]);
++	
++	obj = bpf_object__open_file(filename, NULL);
++	if (libbpf_get_error(obj)) {
++		fprintf(stderr, "ERROR: opening BPF object file failed\n");
++		return 0;
++	}
++
++	/* load BPF program */
++	if (bpf_object__load(obj)) {
++		fprintf(stderr, "ERROR: loading BPF object file failed\n");
++		goto cleanup;
++	}
++
++    map_fd = bpf_object__find_map_fd_by_name(obj, "allocs");
++	if (map_fd < 0) {
++		fprintf(stderr, "ERROR: finding a map in obj file failed\n");
++		goto cleanup;
++	}
++
++
++	bpf_object__for_each_program(prog, obj) {
++		links[j] = bpf_program__attach(prog);
++		if (libbpf_get_error(links[j])) {
++			fprintf(stderr, "ERROR: bpf_program__attach failed\n");
++			links[j] = NULL;
++			goto cleanup;
++		}
++		j++;
++	}
++
++	if (signal(SIGINT, sig_int) == SIG_ERR) {
++		fprintf(stderr, "can't set signal handler: %s\n", strerror(errno));
++		goto cleanup;
++	}
++
++    printf("Please run `sudo cat /sys/kernel/debug/tracing/trace_pipe` "
++	       "to see output of the BPF programs.\n");
++
++	
++	printf("start tracing\n");
++    while (!stop) {
++        // fprintf(stderr, ".");
++        // sleep(1);
++		static char buf[4096];
++		ssize_t sz;
++		sz = read(trace_fd, buf, sizeof(buf) - 1);
++		if (sz > 0) {
++			buf[sz] = '\0';
++			// printf("trace: %s\n", buf);
++			puts(buf);
++		}
++    }
++
++
++    cleanup:
++        // bpf_link__destroy(link);
++        int count = 0;
++        printf("\nprint map\n");
++        while (bpf_map_get_next_key(map_fd, &key, &next_key) == 0) {
++            bpf_map_lookup_elem(map_fd, &next_key, &val);
++            key = next_key;
++            printf("%5d:%016lx:%d\n", ++count, key, val);
++        }
++		for (j--; j >= 0; j--)
++			bpf_link__destroy(links[j]);
++	    bpf_object__close(obj);
++		close(trace_fd);
++        return 0;
++
++
++
++
++    return 0;
++}
+\ No newline at end of file
+diff --git a/samples/bpf/Makefile b/samples/bpf/Makefile
+index 93d894230..3235e81ae 100644
+--- a/samples/bpf/Makefile
++++ b/samples/bpf/Makefile
+@@ -55,6 +55,7 @@ tprogs-y += hbm
+ tprogs-y += kmalloc_ret
+ tprogs-y += cf_track
+ tprogs-y += kmalloc_branch
++tprogs-y += ERA_test0
+ 
+ # tprogs-y += xdp_redirect_cpu
+ # tprogs-y += xdp_redirect_map_multi
+@@ -120,6 +121,7 @@ hbm-objs := hbm.o $(CGROUP_HELPERS)
+ kmalloc_ret-objs := kmalloc_ret.o
+ cf_track-objs := cf_track.o
+ kmalloc_branch-objs := kmalloc_branch.o
++ERA_test0-objs := ERA_test0.o
+ 
+ # xdp_redirect_map_multi-objs := xdp_redirect_map_multi_user.o $(XDP_SAMPLE)
+ # xdp_redirect_cpu-objs := xdp_redirect_cpu_user.o $(XDP_SAMPLE)
+@@ -187,6 +189,7 @@ always-y += xdpsock_kern.o
+ always-y += kmalloc_ret.bpf.o
+ always-y += cf_track.bpf.o
+ always-y += kmalloc_branch.bpf.o
++always-y += ERA_test0.bpf.o
+ 
+ ifeq ($(ARCH), arm)
+ # Strip all except -D__LINUX_ARM_ARCH__ option needed to handle linux
+@@ -230,11 +233,11 @@ TPROGLDLIBS_xsk_fwd		+= -pthread
+ 
+ # Allows pointing LLC/CLANG to a LLVM backend with bpf support, redefine on cmdline:
+ # make M=samples/bpf LLC=~/git/llvm-project/llvm/build/bin/llc CLANG=~/git/llvm-project/llvm/build/bin/clang
+-LLC ?= llc
++LLC ?= llc-13
+ CLANG ?= clang
+-OPT ?= opt
+-LLVM_DIS ?= llvm-dis
+-LLVM_OBJCOPY ?= llvm-objcopy
++OPT ?= opt-13
++LLVM_DIS ?= llvm-dis-13
++LLVM_OBJCOPY ?= llvm-objcopy-13
+ BTF_PAHOLE ?= pahole
+ 
+ # Detect that we're cross compiling and use the cross compiler
+-- 
+2.32.0
+

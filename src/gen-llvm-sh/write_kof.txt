@@ -1,0 +1,14 @@
+arch/x86/kernel/cpu/resctrl/rdtgroup
+arch/x86/kernel/cpu/resctrl/ctrlmondata
+kernel/cgroup/cgroup
+kernel/cgroup/cgroup-v1
+kernel/cgroup/rdma
+kernel/cgroup/cpuset
+mm/memcontrol
+mm/hugetlb_cgroup
+fs/kernfs/file
+fs/sysfs/file
+security/device_cgroup
+block/blk-throttle
+block/blk-iocost
+block/bfq-cgroup

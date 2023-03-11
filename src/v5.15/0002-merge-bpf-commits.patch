@@ -1,0 +1,1756 @@
+From 2b31c64faed066259b3e19417e156f42baf88561 Mon Sep 17 00:00:00 2001
+From: purplewall1206 <wzc@smail.nju.edu.cn>
+Date: Fri, 5 Aug 2022 17:03:15 +0800
+Subject: [PATCH 2/2] merge bpf commits
+
+---
+ include/linux/bpf.h              |   6 +
+ include/linux/slab.h             |   5 +
+ include/uapi/linux/bpf.h         |  14 ++
+ kernel/bpf/core.c                |   3 +
+ kernel/trace/bpf_trace.c         |  29 ++++
+ mm/slub.c                        |  46 ++++++
+ samples/bpf/Makefile             |  94 ++++++-----
+ samples/bpf/cf_track.bpf.c       |  98 +++++++++++
+ samples/bpf/cf_track.c           | 152 +++++++++++++++++
+ samples/bpf/kmalloc_branch.bpf.c | 108 ++++++++++++
+ samples/bpf/kmalloc_branch.c     |  95 +++++++++++
+ samples/bpf/kmalloc_ret.bpf.c    |  91 +++++++++++
+ samples/bpf/kmalloc_ret.c        | 152 +++++++++++++++++
+ samples/ebpf/Makefile            | 271 +++++++++++++++++++++++++++++++
+ samples/ebpf/kmalloc_ret.bpf.c   | 122 ++++++++++++++
+ samples/ebpf/kmalloc_ret.c       | 152 +++++++++++++++++
+ tools/include/uapi/linux/bpf.h   |  14 ++
+ 17 files changed, 1411 insertions(+), 41 deletions(-)
+ create mode 100644 samples/bpf/cf_track.bpf.c
+ create mode 100644 samples/bpf/cf_track.c
+ create mode 100644 samples/bpf/kmalloc_branch.bpf.c
+ create mode 100644 samples/bpf/kmalloc_branch.c
+ create mode 100644 samples/bpf/kmalloc_ret.bpf.c
+ create mode 100644 samples/bpf/kmalloc_ret.c
+ create mode 100644 samples/ebpf/Makefile
+ create mode 100644 samples/ebpf/kmalloc_ret.bpf.c
+ create mode 100644 samples/ebpf/kmalloc_ret.c
+
+diff --git a/include/linux/bpf.h b/include/linux/bpf.h
+index 3db6f6c95..71f47fbbc 100644
+--- a/include/linux/bpf.h
++++ b/include/linux/bpf.h
+@@ -2106,6 +2106,12 @@ extern const struct bpf_func_proto bpf_btf_find_by_name_kind_proto;
+ extern const struct bpf_func_proto bpf_sk_setsockopt_proto;
+ extern const struct bpf_func_proto bpf_sk_getsockopt_proto;
+ 
++
++extern const struct bpf_func_proto bpf_kmalloc_proto;
++extern const struct bpf_func_proto bpf_kfree_proto;
++
++
++
+ const struct bpf_func_proto *tracing_prog_func_proto(
+   enum bpf_func_id func_id, const struct bpf_prog *prog);
+ 
+diff --git a/include/linux/slab.h b/include/linux/slab.h
+index 083f3ce55..1ad7b86b0 100644
+--- a/include/linux/slab.h
++++ b/include/linux/slab.h
+@@ -596,6 +596,11 @@ static __always_inline void *kmalloc(size_t size, gfp_t flags)
+ 	return __kmalloc(size, flags);
+ }
+ 
++
++void *secure_kmalloc(size_t size, gfp_t flags);
++void secure_kfree(void* addr);
++
++
+ static __always_inline void *kmalloc_node(size_t size, gfp_t flags, int node)
+ {
+ #ifndef CONFIG_SLOB
+diff --git a/include/uapi/linux/bpf.h b/include/uapi/linux/bpf.h
+index 791f31dd0..86550312e 100644
+--- a/include/uapi/linux/bpf.h
++++ b/include/uapi/linux/bpf.h
+@@ -4877,6 +4877,18 @@ union bpf_attr {
+  *		Get the struct pt_regs associated with **task**.
+  *	Return
+  *		A pointer to struct pt_regs.
++ *
++ * long bpf_kmalloc(u64 size, u32 flag)
++ *	Description
++ *		kmalloc wrapper.
++ *	Return
++ *		allocated memory address.
++ *
++ * int bpf_kfree(void *x)
++ *	Description
++ *		kfree wrapper.
++ *	Return
++ *		0.
+  */
+ #define __BPF_FUNC_MAPPER(FN)		\
+ 	FN(unspec),			\
+@@ -5055,6 +5067,8 @@ union bpf_attr {
+ 	FN(get_func_ip),		\
+ 	FN(get_attach_cookie),		\
+ 	FN(task_pt_regs),		\
++	FN(kmalloc),		\
++	FN(kfree),			\
+ 	/* */
+ 
+ /* integer value in 'imm' field of BPF_CALL instruction selects which helper
+diff --git a/kernel/bpf/core.c b/kernel/bpf/core.c
+index 6e3ae90ad..1083728f2 100644
+--- a/kernel/bpf/core.c
++++ b/kernel/bpf/core.c
+@@ -2360,6 +2360,9 @@ const struct bpf_func_proto bpf_get_ns_current_pid_tgid_proto __weak;
+ const struct bpf_func_proto bpf_snprintf_btf_proto __weak;
+ const struct bpf_func_proto bpf_seq_printf_btf_proto __weak;
+ 
++const struct bpf_func_proto bpf_kmalloc_proto  __weak;
++const struct bpf_func_proto bpf_kfree_proto  __weak;
++
+ const struct bpf_func_proto * __weak bpf_get_trace_printk_proto(void)
+ {
+ 	return NULL;
+diff --git a/kernel/trace/bpf_trace.c b/kernel/trace/bpf_trace.c
+index 8e2eb950a..5f2d1776c 100644
+--- a/kernel/trace/bpf_trace.c
++++ b/kernel/trace/bpf_trace.c
+@@ -1017,6 +1017,31 @@ static const struct bpf_func_proto bpf_get_attach_cookie_proto_pe = {
+ 	.arg1_type	= ARG_PTR_TO_CTX,
+ };
+ 
++
++BPF_CALL_2(bpf_kmalloc, u64, size, u32, flags)
++{
++	return (unsigned long)secure_kmalloc(size, flags);
++}
++
++const struct bpf_func_proto bpf_kmalloc_proto = {
++	.func = bpf_kmalloc,
++	.ret_type = RET_PTR_TO_ALLOC_MEM_OR_NULL,
++	.arg1_type = ARG_ANYTHING,
++	.arg2_type = ARG_ANYTHING,
++};
++
++BPF_CALL_1(bpf_kfree, void*, x)
++{
++	secure_kfree(x);
++	return 0;
++}
++
++const struct bpf_func_proto bpf_kfree_proto = {
++	.func = bpf_kfree,
++	.ret_type = RET_INTEGER,
++	.arg1_type = ARG_ANYTHING,
++};
++
+ static const struct bpf_func_proto *
+ bpf_tracing_func_proto(enum bpf_func_id func_id, const struct bpf_prog *prog)
+ {
+@@ -1132,6 +1157,10 @@ bpf_tracing_func_proto(enum bpf_func_id func_id, const struct bpf_prog *prog)
+ 		return &bpf_snprintf_proto;
+ 	case BPF_FUNC_get_func_ip:
+ 		return &bpf_get_func_ip_proto_tracing;
++	case BPF_FUNC_kmalloc:
++		return &bpf_kmalloc_proto;
++	case BPF_FUNC_kfree:
++		return &bpf_kfree_proto;
+ 	default:
+ 		return bpf_base_func_proto(func_id);
+ 	}
+diff --git a/mm/slub.c b/mm/slub.c
+index d8f773463..f8694ee88 100644
+--- a/mm/slub.c
++++ b/mm/slub.c
+@@ -3241,6 +3241,7 @@ void *kmem_cache_alloc_trace(struct kmem_cache *s, gfp_t gfpflags, size_t size)
+ 	return ret;
+ }
+ EXPORT_SYMBOL(kmem_cache_alloc_trace);
++ALLOW_ERROR_INJECTION(kmem_cache_alloc_trace, NONE);
+ #endif
+ 
+ #ifdef CONFIG_NUMA
+@@ -4402,6 +4403,31 @@ void *__kmalloc(size_t size, gfp_t flags)
+ 	return ret;
+ }
+ EXPORT_SYMBOL(__kmalloc);
++ALLOW_ERROR_INJECTION(__kmalloc, NONE);
++
++
++void *secure_kmalloc(size_t size, gfp_t flags)
++{
++	struct kmem_cache *s;
++	void *ret;
++
++	if (unlikely(size > KMALLOC_MAX_CACHE_SIZE))
++		return kmalloc_large(size, flags);
++
++	s = kmalloc_slab(size, flags);
++
++	if (unlikely(ZERO_OR_NULL_PTR(s)))
++		return s;
++
++	ret = slab_alloc(s, flags, _RET_IP_, size);
++
++	trace_kmalloc(_RET_IP_, ret, size, s->size, flags);
++
++	ret = kasan_kmalloc(s, ret, size, flags);
++
++	return ret;
++}
++EXPORT_SYMBOL(secure_kmalloc);
+ 
+ #ifdef CONFIG_NUMA
+ static void *kmalloc_large_node(size_t size, gfp_t flags, int node)
+@@ -4552,6 +4578,26 @@ void kfree(const void *x)
+ 	slab_free(page->slab_cache, page, object, NULL, 1, _RET_IP_);
+ }
+ EXPORT_SYMBOL(kfree);
++ALLOW_ERROR_INJECTION(kfree, NONE);
++
++void secure_kfree(void* x)
++{
++	struct page *page;
++	void *object = (void *)x;
++
++	trace_kfree(_RET_IP_, x);
++
++	if (unlikely(ZERO_OR_NULL_PTR(x)))
++		return;
++
++	page = virt_to_head_page(x);
++	if (unlikely(!PageSlab(page))) {
++		free_nonslab_page(page, object);
++		return;
++	}
++	slab_free(page->slab_cache, page, object, NULL, 1, _RET_IP_);
++}
++EXPORT_SYMBOL(secure_kfree);
+ 
+ #define SHRINK_PROMOTE_MAX 32
+ 
+diff --git a/samples/bpf/Makefile b/samples/bpf/Makefile
+index 5fd48a8d4..93d894230 100644
+--- a/samples/bpf/Makefile
++++ b/samples/bpf/Makefile
+@@ -4,9 +4,9 @@ BPF_SAMPLES_PATH ?= $(abspath $(srctree)/$(src))
+ TOOLS_PATH := $(BPF_SAMPLES_PATH)/../../tools
+ 
+ # List of programs to build
+-tprogs-y := test_lru_dist
+-tprogs-y += sock_example
+-tprogs-y += fds_example
++# tprogs-y := test_lru_dist
++# tprogs-y += sock_example
++# tprogs-y += fds_example
+ tprogs-y += sockex1
+ tprogs-y += sockex2
+ tprogs-y += sockex3
+@@ -14,7 +14,7 @@ tprogs-y += tracex1
+ tprogs-y += tracex2
+ tprogs-y += tracex3
+ tprogs-y += tracex4
+-tprogs-y += tracex5
++# tprogs-y += tracex5
+ tprogs-y += tracex6
+ tprogs-y += tracex7
+ tprogs-y += test_probe_write_user
+@@ -24,10 +24,10 @@ tprogs-y += offwaketime
+ tprogs-y += spintest
+ tprogs-y += map_perf_test
+ tprogs-y += test_overhead
+-tprogs-y += test_cgrp2_array_pin
+-tprogs-y += test_cgrp2_attach
+-tprogs-y += test_cgrp2_sock
+-tprogs-y += test_cgrp2_sock2
++# tprogs-y += test_cgrp2_array_pin
++# tprogs-y += test_cgrp2_attach
++# tprogs-y += test_cgrp2_sock
++# tprogs-y += test_cgrp2_sock2
+ tprogs-y += xdp1
+ tprogs-y += xdp2
+ tprogs-y += xdp_router_ipv4
+@@ -38,25 +38,29 @@ tprogs-y += tc_l2_redirect
+ tprogs-y += lwt_len_hist
+ tprogs-y += xdp_tx_iptunnel
+ tprogs-y += test_map_in_map
+-tprogs-y += per_socket_stats_example
+-tprogs-y += xdp_rxq_info
++# tprogs-y += per_socket_stats_example
++# tprogs-y += xdp_rxq_info
+ tprogs-y += syscall_tp
+ tprogs-y += cpustat
+-tprogs-y += xdp_adjust_tail
+-tprogs-y += xdpsock
+-tprogs-y += xdpsock_ctrl_proc
+-tprogs-y += xsk_fwd
+-tprogs-y += xdp_fwd
++# tprogs-y += xdp_adjust_tail
++# tprogs-y += xdpsock
++# tprogs-y += xdpsock_ctrl_proc
++# tprogs-y += xsk_fwd
++# tprogs-y += xdp_fwd
+ tprogs-y += task_fd_query
+-tprogs-y += xdp_sample_pkts
++# tprogs-y += xdp_sample_pkts
+ tprogs-y += ibumad
+ tprogs-y += hbm
+ 
+-tprogs-y += xdp_redirect_cpu
+-tprogs-y += xdp_redirect_map_multi
+-tprogs-y += xdp_redirect_map
+-tprogs-y += xdp_redirect
+-tprogs-y += xdp_monitor
++tprogs-y += kmalloc_ret
++tprogs-y += cf_track
++tprogs-y += kmalloc_branch
++
++# tprogs-y += xdp_redirect_cpu
++# tprogs-y += xdp_redirect_map_multi
++# tprogs-y += xdp_redirect_map
++# tprogs-y += xdp_redirect
++# tprogs-y += xdp_monitor
+ 
+ # Libbpf dependencies
+ LIBBPF = $(TOOLS_PATH)/lib/bpf/libbpf.a
+@@ -73,7 +77,7 @@ tracex1-objs := tracex1_user.o $(TRACE_HELPERS)
+ tracex2-objs := tracex2_user.o
+ tracex3-objs := tracex3_user.o
+ tracex4-objs := tracex4_user.o
+-tracex5-objs := tracex5_user.o $(TRACE_HELPERS)
++# tracex5-objs := tracex5_user.o $(TRACE_HELPERS)
+ tracex6-objs := tracex6_user.o
+ tracex7-objs := tracex7_user.o
+ test_probe_write_user-objs := test_probe_write_user_user.o
+@@ -83,10 +87,10 @@ offwaketime-objs := offwaketime_user.o $(TRACE_HELPERS)
+ spintest-objs := spintest_user.o $(TRACE_HELPERS)
+ map_perf_test-objs := map_perf_test_user.o
+ test_overhead-objs := test_overhead_user.o
+-test_cgrp2_array_pin-objs := test_cgrp2_array_pin.o
+-test_cgrp2_attach-objs := test_cgrp2_attach.o
+-test_cgrp2_sock-objs := test_cgrp2_sock.o
+-test_cgrp2_sock2-objs := test_cgrp2_sock2.o
++# test_cgrp2_array_pin-objs := test_cgrp2_array_pin.o
++# test_cgrp2_attach-objs := test_cgrp2_attach.o
++# test_cgrp2_sock-objs := test_cgrp2_sock.o
++# test_cgrp2_sock2-objs := test_cgrp2_sock2.o
+ xdp1-objs := xdp1_user.o
+ # reuse xdp1 source intentionally
+ xdp2-objs := xdp1_user.o
+@@ -99,25 +103,29 @@ tc_l2_redirect-objs := tc_l2_redirect_user.o
+ lwt_len_hist-objs := lwt_len_hist_user.o
+ xdp_tx_iptunnel-objs := xdp_tx_iptunnel_user.o
+ test_map_in_map-objs := test_map_in_map_user.o
+-per_socket_stats_example-objs := cookie_uid_helper_example.o
++# per_socket_stats_example-objs := cookie_uid_helper_example.o
+ xdp_rxq_info-objs := xdp_rxq_info_user.o
+ syscall_tp-objs := syscall_tp_user.o
+ cpustat-objs := cpustat_user.o
+-xdp_adjust_tail-objs := xdp_adjust_tail_user.o
+-xdpsock-objs := xdpsock_user.o
+-xdpsock_ctrl_proc-objs := xdpsock_ctrl_proc.o
+-xsk_fwd-objs := xsk_fwd.o
+-xdp_fwd-objs := xdp_fwd_user.o
++# xdp_adjust_tail-objs := xdp_adjust_tail_user.o
++# xdpsock-objs := xdpsock_user.o
++# xdpsock_ctrl_proc-objs := xdpsock_ctrl_proc.o
++# xsk_fwd-objs := xsk_fwd.o
++# xdp_fwd-objs := xdp_fwd_user.o
+ task_fd_query-objs := task_fd_query_user.o $(TRACE_HELPERS)
+-xdp_sample_pkts-objs := xdp_sample_pkts_user.o
++# xdp_sample_pkts-objs := xdp_sample_pkts_user.o
+ ibumad-objs := ibumad_user.o
+ hbm-objs := hbm.o $(CGROUP_HELPERS)
+ 
+-xdp_redirect_map_multi-objs := xdp_redirect_map_multi_user.o $(XDP_SAMPLE)
+-xdp_redirect_cpu-objs := xdp_redirect_cpu_user.o $(XDP_SAMPLE)
+-xdp_redirect_map-objs := xdp_redirect_map_user.o $(XDP_SAMPLE)
+-xdp_redirect-objs := xdp_redirect_user.o $(XDP_SAMPLE)
+-xdp_monitor-objs := xdp_monitor_user.o $(XDP_SAMPLE)
++kmalloc_ret-objs := kmalloc_ret.o
++cf_track-objs := cf_track.o
++kmalloc_branch-objs := kmalloc_branch.o
++
++# xdp_redirect_map_multi-objs := xdp_redirect_map_multi_user.o $(XDP_SAMPLE)
++# xdp_redirect_cpu-objs := xdp_redirect_cpu_user.o $(XDP_SAMPLE)
++# xdp_redirect_map-objs := xdp_redirect_map_user.o $(XDP_SAMPLE)
++# xdp_redirect-objs := xdp_redirect_user.o $(XDP_SAMPLE)
++# xdp_monitor-objs := xdp_monitor_user.o $(XDP_SAMPLE)
+ 
+ # Tell kbuild to always build the programs
+ always-y := $(tprogs-y)
+@@ -128,7 +136,7 @@ always-y += tracex1_kern.o
+ always-y += tracex2_kern.o
+ always-y += tracex3_kern.o
+ always-y += tracex4_kern.o
+-always-y += tracex5_kern.o
++# always-y += tracex5_kern.o
+ always-y += tracex6_kern.o
+ always-y += tracex7_kern.o
+ always-y += sock_flags_kern.o
+@@ -144,7 +152,7 @@ always-y += test_overhead_tp_kern.o
+ always-y += test_overhead_raw_tp_kern.o
+ always-y += test_overhead_kprobe_kern.o
+ always-y += parse_varlen.o parse_simple.o parse_ldabs.o
+-always-y += test_cgrp2_tc_kern.o
++# always-y += test_cgrp2_tc_kern.o
+ always-y += xdp1_kern.o
+ always-y += xdp2_kern.o
+ always-y += xdp_router_ipv4_kern.o
+@@ -176,6 +184,10 @@ always-y += hbm_out_kern.o
+ always-y += hbm_edt_kern.o
+ always-y += xdpsock_kern.o
+ 
++always-y += kmalloc_ret.bpf.o
++always-y += cf_track.bpf.o
++always-y += kmalloc_branch.bpf.o
++
+ ifeq ($(ARCH), arm)
+ # Strip all except -D__LINUX_ARM_ARCH__ option needed to handle linux
+ # headers when arm instruction set identification is requested.
+@@ -315,7 +327,7 @@ $(obj)/xdp_redirect_map_user.o: $(obj)/xdp_redirect_map.skel.h
+ $(obj)/xdp_redirect_user.o: $(obj)/xdp_redirect.skel.h
+ $(obj)/xdp_monitor_user.o: $(obj)/xdp_monitor.skel.h
+ 
+-$(obj)/tracex5_kern.o: $(obj)/syscall_nrs.h
++# $(obj)/tracex5_kern.o: $(obj)/syscall_nrs.h
+ $(obj)/hbm_out_kern.o: $(src)/hbm.h $(src)/hbm_kern.h
+ $(obj)/hbm.o: $(src)/hbm.h
+ $(obj)/hbm_edt_kern.o: $(src)/hbm.h $(src)/hbm_kern.h
+diff --git a/samples/bpf/cf_track.bpf.c b/samples/bpf/cf_track.bpf.c
+new file mode 100644
+index 000000000..9fe72a00c
+--- /dev/null
++++ b/samples/bpf/cf_track.bpf.c
+@@ -0,0 +1,98 @@
++#include "vmlinux.h"
++#include <bpf/bpf_helpers.h>
++#include <bpf/bpf_tracing.h>
++#include <bpf/bpf_core_read.h>
++
++struct {
++    __uint(type, BPF_MAP_TYPE_ARRAY);
++    __uint(max_entries, 20);
++    __type(key, u32);
++    __type(value, u32);
++} pcpu_flags SEC(".maps");
++
++#define GFP_KERNEL	(__GFP_IO | __GFP_FS)
++char LICENSE[] SEC("license") = "Dual BSD/GPL";
++
++SEC("kprobe/bcm_sendmsg")
++int BPF_KPROBE(probe0)
++{
++    u32 cpu = bpf_get_smp_processor_id();
++    u32 pid = bpf_get_current_pid_tgid();
++    int err = 0;
++    err = bpf_map_update_elem(&pcpu_flags, &cpu, &pid, BPF_ANY);
++    if (err < 0) {
++        bpf_printk("bcm_sendmsg start map err %d\n", err);
++        return err;
++    }
++    bpf_printk("bcm_sendmsg start %u %u\n", cpu, pid);
++    return 0;
++}
++
++
++SEC("kretprobe/bcm_sendmsg")
++int BPF_KRETPROBE(probe1)
++{
++    u32 cpu = bpf_get_smp_processor_id();
++    u32 pid = bpf_get_current_pid_tgid();
++    u32 val = 0;
++    int err = 0;
++    u32 *pval = NULL;
++    pval = bpf_map_lookup_elem(&pcpu_flags, &cpu);
++    if (pval) {
++        if (*pval == pid) {
++            bpf_printk("bcm_sendmsg end   %u %u\n", cpu, pid);
++            err = bpf_map_update_elem(&pcpu_flags, &cpu, &val, BPF_ANY);
++            if (err < 0) {
++                bpf_printk("bcm_sendmsg end map err %d\n", err);
++                return err;
++            }
++        }
++    }
++    return 0;
++}
++
++u64 count = 0;
++SEC("kprobe/__kmalloc")
++int BPF_KPROBE(probe2)
++{
++    u32 len = ctx->di;
++    u32 flag = ctx->si;
++    u32 cpu = bpf_get_smp_processor_id();
++    u32 pid = bpf_get_current_pid_tgid();
++    int err = 0;
++    u32 *pval = NULL;
++
++
++    pval = bpf_map_lookup_elem(&pcpu_flags, &cpu);
++    if (pval) {
++        if (*pval == pid) {
++            ++count;
++            bpf_printk("__kmalloc under bcm_sendmsg: len:%u  %utimes\n", len, count);
++        }
++    }
++
++    return 0;
++
++}
++
++SEC("kprobe/kmem_cache_alloc_trace")
++int BPF_KPROBE(probe3)
++{
++    u32 len = ctx->dx;
++    u32 cpu = bpf_get_smp_processor_id();
++    u32 pid = bpf_get_current_pid_tgid();
++    int err = 0;
++    u32 *pval = NULL;
++
++
++    pval = bpf_map_lookup_elem(&pcpu_flags, &cpu);
++    if (pval) {
++        if (*pval == pid) {
++            ++count;
++            bpf_printk("kmem_cache_alloc_trace under bcm_sendmsg: len:%u  %utimes\n", len, count);
++        }
++    }
++
++    return 0;
++
++}
+\ No newline at end of file
+diff --git a/samples/bpf/cf_track.c b/samples/bpf/cf_track.c
+new file mode 100644
+index 000000000..0f5e22a9a
+--- /dev/null
++++ b/samples/bpf/cf_track.c
+@@ -0,0 +1,152 @@
++#include <stdio.h>
++#include <unistd.h>
++#include <signal.h>
++#include <string.h>
++#include <errno.h>
++#include <sys/resource.h>
++#include <bpf/libbpf.h>
++// #include "kmalloc_ret.skel.h"
++
++static int libbpf_print_fn(enum libbpf_print_level level, const char *format, va_list args)
++{
++	return vfprintf(stderr, format, args);
++}
++
++static volatile sig_atomic_t stop;
++
++static void sig_int(int signo)
++{
++	stop = 1;
++}
++
++// int main(int argc, char **argv)
++// {
++//     struct kmalloc_ret *skel;
++//     int err;
++
++//     libbpf_set_strict_mode(LIBBPF_STRICT_ALL);
++
++//     libbpf_set_print(libbpf_print_fn);
++
++//     skel = kmalloc_ret__open_and_load();
++//     if (!skel) {
++// 		fprintf(stderr, "Failed to open BPF skeleton\n");
++// 		return 1;
++// 	}
++
++//     err = kmalloc_ret__attach(skel);
++
++//     if (err) {
++// 		fprintf(stderr, "Failed to attach BPF skeleton\n");
++// 		goto cleanup;
++// 	}
++
++//     // skel->maps.kmalloc_count;
++
++// 	if (signal(SIGINT, sig_int) == SIG_ERR) {
++// 		fprintf(stderr, "can't set signal handler: %s\n", strerror(errno));
++// 		goto cleanup;
++// 	}
++
++// 	printf("Please run `sudo cat /sys/kernel/debug/tracing/trace_pipe` "
++// 	       "to see output of the BPF programs.\n");
++
++//     while (!stop) {
++//         fprintf(stderr, ".");
++//         sleep(1);
++//     }
++
++//     cleanup:
++//         kmalloc_ret__destroy(skel);
++//         return -err;
++// }
++
++
++
++
++
++int main(int argc, char **argv)
++{
++    struct bpf_link *links[2];
++	struct bpf_program *prog;
++	struct bpf_object *obj;
++	char filename[256];
++	int map_fd, i, j = 0;
++	__u64 key, next_key, val;
++
++    snprintf(filename, sizeof(filename), "%s.bpf.o", argv[0]);
++	
++	obj = bpf_object__open_file(filename, NULL);
++	if (libbpf_get_error(obj)) {
++		fprintf(stderr, "ERROR: opening BPF object file failed\n");
++		return 0;
++	}
++
++	/* load BPF program */
++	if (bpf_object__load(obj)) {
++		fprintf(stderr, "ERROR: loading BPF object file failed\n");
++		goto cleanup;
++	}
++
++	// prog = bpf_object__find_program_by_name(obj, "kmalloc_ret");
++	// if (!prog) {
++	// 	fprintf(stderr, "ERROR: finding a prog in obj file failed\n");
++	// 	goto cleanup;
++	// }
++
++    // link = bpf_program__attach(prog);
++	// if (libbpf_get_error(link)) {
++	// 	fprintf(stderr, "ERROR: bpf_program__attach failed\n");
++	// 	link = NULL;
++	// 	goto cleanup;
++	// }
++
++	map_fd = bpf_object__find_map_fd_by_name(obj, "pcpu_flags");
++	if (map_fd < 0) {
++		fprintf(stderr, "ERROR: finding a map in obj file failed\n");
++		goto cleanup;
++	}
++
++	bpf_object__for_each_program(prog, obj) {
++		links[j] = bpf_program__attach(prog);
++		if (libbpf_get_error(links[j])) {
++			fprintf(stderr, "ERROR: bpf_program__attach failed\n");
++			links[j] = NULL;
++			goto cleanup;
++		}
++		j++;
++	}
++
++	if (signal(SIGINT, sig_int) == SIG_ERR) {
++		fprintf(stderr, "can't set signal handler: %s\n", strerror(errno));
++		goto cleanup;
++	}
++
++    printf("Please run `sudo cat /sys/kernel/debug/tracing/trace_pipe` "
++	       "to see output of the BPF programs.\n");
++
++    while (!stop) {
++        fprintf(stderr, ".");
++        sleep(1);
++    }
++
++	int count = 0;
++	printf("\nprint map\n");
++	while (bpf_map_get_next_key(map_fd, &key, &next_key) == 0) {
++		bpf_map_lookup_elem(map_fd, &next_key, &val);
++		key = next_key;
++		printf("%5d:%016lx:%d\n", ++count, key, val);
++	}
++
++    cleanup:
++        // bpf_link__destroy(link);
++		for (j--; j >= 0; j--)
++			bpf_link__destroy(links[j]);
++	    bpf_object__close(obj);
++        return 0;
++
++
++
++
++    return 0;
++}
+\ No newline at end of file
+diff --git a/samples/bpf/kmalloc_branch.bpf.c b/samples/bpf/kmalloc_branch.bpf.c
+new file mode 100644
+index 000000000..fc6dad32e
+--- /dev/null
++++ b/samples/bpf/kmalloc_branch.bpf.c
+@@ -0,0 +1,108 @@
++#include "vmlinux.h"
++#include <bpf/bpf_helpers.h>
++#include <bpf/bpf_tracing.h>
++#include <bpf/bpf_core_read.h>
++// #include <linux/gfp.h>
++// #include <linux/slab.h>
++#define ___GFP_IO		0x40u
++#define ___GFP_FS		0x80u
++#define __GFP_IO	(___GFP_IO)
++#define __GFP_FS	(___GFP_FS)
++
++// #define GFP_KERNEL	(__GFP_RECLAIM | __GFP_IO | __GFP_FS)
++#define GFP_KERNEL	(__GFP_IO | __GFP_FS)
++char LICENSE[] SEC("license") = "Dual BSD/GPL";
++
++
++// ffffffff812f0b10 <__kmalloc>:
++// ffffffff812f0b10:       e8 6b 4c d8 ff          call   ffffffff81075780 <__fentry__>    ffffffff812f0b11: R_X86_64_PLT32        __fentry__-0x4
++// ffffffff812f0b15:       55                      push   %rbp
++
++// ffffffff812f0b2d:       48 81 ff 00 20 00 00    cmp    $0x2000,%rdi
++// ffffffff812f0b34:       0f 87 50 03 00 00       ja     ffffffff812f0e8a <__kmalloc+0x37a>
++// ffffffff812f0b3a:       8b 5d d4                mov    -0x2c(%rbp),%ebx
++// ffffffff812f0b3d:       48 8b 7d c8             mov    -0x38(%rbp),%rdi
++
++// ffffffff812f0b4b:       48 83 f8 10             cmp    $0x10,%rax
++// ffffffff812f0b4f:       0f 86 56 03 00 00       jbe    ffffffff812f0eab <__kmalloc+0x39b>
++// ffffffff812f0b55:       23 1d 19 67 e7 01       and    0x1e76719(%rip),%ebx        # ffffffff83167274 <gfp_allowed_mask>        ffffffff812f0b57: R_X86_64_PC32 gfp_allowed_mask-0x4
++// ffffffff812f0b5b:       4c 8b 7d 08             mov    0x8(%rbp),%r15
++
++// int replace = 0;
++
++// int count_all = 0;
++// int count_jae = 0;
++// int count_jbe = 0;
++
++// SEC("kprobe/__kmalloc")
++// int BPF_KPROBE(op1)
++// {
++//     ++count_all;    
++//     // bpf_printk("count_all: %d %d %d\n", count_all, count_jae);
++//     return 0;
++// }
++
++// hex(0xffffffff812f0b3a-0xffffffff812f0b10)
++// SEC("kprobe/__kmalloc+0x2a")
++// int BPF_KPROBE(op2)
++// {
++//     ++count_jae;
++//     bpf_printk("count_jae: %d %d\n", count_jae, count_all);
++//     return 0;
++// }
++
++
++// hex(0xffffffff812f0b55-0xffffffff812f0b10)
++// SEC("kprobe/__kmalloc+0x45")
++// int BPF_KPROBE(op3)
++// {
++//     ++count_jbe;
++//     bpf_printk("count_jbe: %d  %d\n", count_jbe, count_all);
++//     return 0;
++// }
++
++// sudo bpftrace -e 'kprobe:__kmalloc {@all=@all+1;}  kprobe:__kmalloc+0x2a {@jae = @jae+1;}'
++// ppw@ppw:~/Documents/linux/samples/ebpf$ sudo bpftrace -e 'kprobe:__kmalloc {@all=@all+1;}  kprobe:__kmalloc+0x36 {@jae = @jae+1;}'
++// Attaching 2 probes...
++// Can't check if kprobe is in proper place (compiled without (k|u)probe offset support): /lib/modules/5.15.0-gcc-bpf+/build/vmlinux:__kmalloc+54
++
++int all_kcab = 0;
++int loop_kcab = 0;
++SEC("kprobe/kmem_cache_alloc_bulk")
++int BPF_KPROBE(op4)
++{
++    ++all_kcab;
++    bpf_printk("all: %d  %d  %lu\n", all_kcab, loop_kcab, (u64)ctx->dx);
++    return 0;
++}
++
++// hex(0xffffffff812efbe2-0xffffffff812efaf0)
++// '0xf2L'
++// hex(0xffffffff812d271f-0xffffffff812d2690)
++// '0x8fL'
++SEC("kprobe/kmem_cache_alloc_bulk+0x8f")
++int BPF_KPROBE(op5)
++{
++    ++loop_kcab;
++    bpf_printk("loop: %d  %d  %lu\n", all_kcab, loop_kcab, (u64)ctx->ax);
++    return 0;
++}
++
++// SEC("kretprobe/kmem_cache_alloc_bulk+0xf2")
++// int BPF_KPROBE(op6)
++// {
++//     bpf_printk("ret: %lu\n", (u64)ctx->ax);
++//     return 0;
++// }
++
++
++
++
++// 0xffffffff812efaf0
++// ffffffff812efbcc:       45 31 ed                xor    %r13d,%r13d
++// ffffffff812efbcf:       4d 85 ff                test   %r15,%r15
++// ffffffff812efbd2:       0f 84 cb 00 00 00       je     ffffffff812efca3 <kmem_cache_alloc_bulk+0x1b3>
++// ffffffff812efbd8:       45 31 db                xor    %r11d,%r11d
++// ffffffff812efbdb:       eb 37                   jmp    ffffffff812efc14 <kmem_cache_alloc_bulk+0x124>
++// ffffffff812efbdd:       41 8b 44 24 28          mov    0x28(%r12),%eax 
++// ffffffff812efbe2:       48 01 d0                add    %rdx,%rax   // here
+\ No newline at end of file
+diff --git a/samples/bpf/kmalloc_branch.c b/samples/bpf/kmalloc_branch.c
+new file mode 100644
+index 000000000..78299e9af
+--- /dev/null
++++ b/samples/bpf/kmalloc_branch.c
+@@ -0,0 +1,95 @@
++#include <stdio.h>
++#include <unistd.h>
++#include <signal.h>
++#include <string.h>
++#include <errno.h>
++#include <sys/resource.h>
++#include <bpf/libbpf.h>
++// #include "kmalloc_ret.skel.h"
++
++static int libbpf_print_fn(enum libbpf_print_level level, const char *format, va_list args)
++{
++	return vfprintf(stderr, format, args);
++}
++
++static volatile sig_atomic_t stop;
++
++static void sig_int(int signo)
++{
++	stop = 1;
++}
++
++
++
++int main(int argc, char **argv)
++{
++    struct bpf_link *links[2];
++	struct bpf_program *prog;
++	struct bpf_object *obj;
++	char filename[256];
++	int map_fd, i, j = 0;
++	__u64 key, next_key, val;
++
++    snprintf(filename, sizeof(filename), "%s.bpf.o", argv[0]);
++	
++	obj = bpf_object__open_file(filename, NULL);
++	if (libbpf_get_error(obj)) {
++		fprintf(stderr, "ERROR: opening BPF object file failed\n");
++		return 0;
++	}
++
++	/* load BPF program */
++	if (bpf_object__load(obj)) {
++		fprintf(stderr, "ERROR: loading BPF object file failed\n");
++		goto cleanup;
++	}
++
++	// prog = bpf_object__find_program_by_name(obj, "kmalloc_ret");
++	// if (!prog) {
++	// 	fprintf(stderr, "ERROR: finding a prog in obj file failed\n");
++	// 	goto cleanup;
++	// }
++
++    // link = bpf_program__attach(prog);
++	// if (libbpf_get_error(link)) {
++	// 	fprintf(stderr, "ERROR: bpf_program__attach failed\n");
++	// 	link = NULL;
++	// 	goto cleanup;
++	// }
++
++	bpf_object__for_each_program(prog, obj) {
++		links[j] = bpf_program__attach(prog);
++		if (libbpf_get_error(links[j])) {
++			fprintf(stderr, "ERROR: bpf_program__attach failed\n");
++			links[j] = NULL;
++			goto cleanup;
++		}
++		j++;
++	}
++
++	if (signal(SIGINT, sig_int) == SIG_ERR) {
++		fprintf(stderr, "can't set signal handler: %s\n", strerror(errno));
++		goto cleanup;
++	}
++
++    printf("Please run `sudo cat /sys/kernel/debug/tracing/trace_pipe` "
++	       "to see output of the BPF programs.\n");
++
++    while (!stop) {
++        fprintf(stderr, ".");
++        sleep(1);
++    }
++
++
++    cleanup:
++        // bpf_link__destroy(link);
++		for (j--; j >= 0; j--)
++			bpf_link__destroy(links[j]);
++	    bpf_object__close(obj);
++        return 0;
++
++
++
++
++    return 0;
++}
+\ No newline at end of file
+diff --git a/samples/bpf/kmalloc_ret.bpf.c b/samples/bpf/kmalloc_ret.bpf.c
+new file mode 100644
+index 000000000..df82a10ab
+--- /dev/null
++++ b/samples/bpf/kmalloc_ret.bpf.c
+@@ -0,0 +1,91 @@
++#include "vmlinux.h"
++#include <bpf/bpf_helpers.h>
++#include <bpf/bpf_tracing.h>
++#include <bpf/bpf_core_read.h>
++// #include <linux/gfp.h>
++// #include <linux/slab.h>
++#define ___GFP_IO		0x40u
++#define ___GFP_FS		0x80u
++#define __GFP_IO	(___GFP_IO)
++#define __GFP_FS	(___GFP_FS)
++
++// #define GFP_KERNEL	(__GFP_RECLAIM | __GFP_IO | __GFP_FS)
++#define GFP_KERNEL	(__GFP_IO | __GFP_FS)
++char LICENSE[] SEC("license") = "Dual BSD/GPL";
++
++struct {
++    __uint(type, BPF_MAP_TYPE_HASH);
++    __uint(max_entries, 40960);
++    __type(key, u64);
++    __type(value, u64);
++} kmalloc_hash SEC(".maps");
++
++// int replace = 0;
++
++SEC("kprobe/__kmalloc")
++int BPF_KPROBE(kmalloc_ret)
++{
++    u64 alloc_len = ctx->di;
++    u32 alloc_flag = ctx->si;
++    int err = 0;
++
++    if (alloc_len > 1000) {
++        bpf_printk("__kmalloc: %lu\n", alloc_len);
++        u64 new = bpf_kmalloc(alloc_len * 2, alloc_flag);
++        bpf_printk("__kmalloc new : %lx\n", new);
++        err = bpf_map_update_elem(&kmalloc_hash, &new, &alloc_len, BPF_ANY);
++        if (err < 0) {
++            bpf_printk("__kmalloc err: %d\n", err);
++            return err;
++        }
++        err = bpf_override_return(ctx, new);
++        bpf_printk("__kmalloc: replace %d\n", err);
++    }
++    
++    return 0;
++}
++
++SEC("kprobe/kmem_cache_alloc_trace")
++int BPF_KPROBE(prog1)
++{
++    u64 alloc_len = ctx->dx;
++    u32 alloc_flag = ctx->si;
++    int err = 0;
++    // u64 val = 1;
++
++    if (alloc_len > 1000) {
++        bpf_printk("kmem_cache_alloc_trace: %lu\n", alloc_len);
++        u64 new = bpf_kmalloc(alloc_len * 2, alloc_flag);
++        bpf_printk("kmem_cache_alloc_trace new : %lx\n", new);
++        err = bpf_map_update_elem(&kmalloc_hash, &new, &alloc_len, BPF_ANY);
++        if (err < 0) {
++            bpf_printk("kmem_cache_alloc_trace err: %d\n", err);
++            return err;
++        }
++        err = bpf_override_return(ctx, new);
++        bpf_printk("kmem_cache_alloc_trace: replace %d\n", err);
++    }
++    return 0;
++}
++
++// bpftrace -e 'kprobe:__kmalloc{if (arg0 > 512) { @[kstack]=count();}}'
++
++SEC("kprobe/kfree")
++int BPF_KPROBE(kmalloc_ret_free)
++{
++    u64 addr = ctx->di;
++    u64 *pval = bpf_map_lookup_elem(&kmalloc_hash, &addr);
++    int err = 0;
++    if (pval) {
++        bpf_printk("kfree %lx  %lu\n", addr, *pval);
++        err = bpf_kfree((void *)addr);
++        err = bpf_map_delete_elem(&kmalloc_hash, &addr);
++        if (err < 0) {
++            bpf_printk("kfree err: %d\n", err);
++            return err;
++        }
++        err = bpf_override_return(ctx, 0);
++        bpf_printk("kfree: replace %d\n", 0);
++    }
++    return 0;
++}
+diff --git a/samples/bpf/kmalloc_ret.c b/samples/bpf/kmalloc_ret.c
+new file mode 100644
+index 000000000..73ac5dcce
+--- /dev/null
++++ b/samples/bpf/kmalloc_ret.c
+@@ -0,0 +1,152 @@
++#include <stdio.h>
++#include <unistd.h>
++#include <signal.h>
++#include <string.h>
++#include <errno.h>
++#include <sys/resource.h>
++#include <bpf/libbpf.h>
++// #include "kmalloc_ret.skel.h"
++
++static int libbpf_print_fn(enum libbpf_print_level level, const char *format, va_list args)
++{
++	return vfprintf(stderr, format, args);
++}
++
++static volatile sig_atomic_t stop;
++
++static void sig_int(int signo)
++{
++	stop = 1;
++}
++
++// int main(int argc, char **argv)
++// {
++//     struct kmalloc_ret *skel;
++//     int err;
++
++//     libbpf_set_strict_mode(LIBBPF_STRICT_ALL);
++
++//     libbpf_set_print(libbpf_print_fn);
++
++//     skel = kmalloc_ret__open_and_load();
++//     if (!skel) {
++// 		fprintf(stderr, "Failed to open BPF skeleton\n");
++// 		return 1;
++// 	}
++
++//     err = kmalloc_ret__attach(skel);
++
++//     if (err) {
++// 		fprintf(stderr, "Failed to attach BPF skeleton\n");
++// 		goto cleanup;
++// 	}
++
++//     // skel->maps.kmalloc_count;
++
++// 	if (signal(SIGINT, sig_int) == SIG_ERR) {
++// 		fprintf(stderr, "can't set signal handler: %s\n", strerror(errno));
++// 		goto cleanup;
++// 	}
++
++// 	printf("Please run `sudo cat /sys/kernel/debug/tracing/trace_pipe` "
++// 	       "to see output of the BPF programs.\n");
++
++//     while (!stop) {
++//         fprintf(stderr, ".");
++//         sleep(1);
++//     }
++
++//     cleanup:
++//         kmalloc_ret__destroy(skel);
++//         return -err;
++// }
++
++
++
++
++
++int main(int argc, char **argv)
++{
++    struct bpf_link *links[2];
++	struct bpf_program *prog;
++	struct bpf_object *obj;
++	char filename[256];
++	int map_fd, i, j = 0;
++	__u64 key, next_key, val;
++
++    snprintf(filename, sizeof(filename), "%s.bpf.o", argv[0]);
++	
++	obj = bpf_object__open_file(filename, NULL);
++	if (libbpf_get_error(obj)) {
++		fprintf(stderr, "ERROR: opening BPF object file failed\n");
++		return 0;
++	}
++
++	/* load BPF program */
++	if (bpf_object__load(obj)) {
++		fprintf(stderr, "ERROR: loading BPF object file failed\n");
++		goto cleanup;
++	}
++
++	// prog = bpf_object__find_program_by_name(obj, "kmalloc_ret");
++	// if (!prog) {
++	// 	fprintf(stderr, "ERROR: finding a prog in obj file failed\n");
++	// 	goto cleanup;
++	// }
++
++    // link = bpf_program__attach(prog);
++	// if (libbpf_get_error(link)) {
++	// 	fprintf(stderr, "ERROR: bpf_program__attach failed\n");
++	// 	link = NULL;
++	// 	goto cleanup;
++	// }
++
++	map_fd = bpf_object__find_map_fd_by_name(obj, "kmalloc_hash");
++	if (map_fd < 0) {
++		fprintf(stderr, "ERROR: finding a map in obj file failed\n");
++		goto cleanup;
++	}
++
++	bpf_object__for_each_program(prog, obj) {
++		links[j] = bpf_program__attach(prog);
++		if (libbpf_get_error(links[j])) {
++			fprintf(stderr, "ERROR: bpf_program__attach failed\n");
++			links[j] = NULL;
++			goto cleanup;
++		}
++		j++;
++	}
++
++	if (signal(SIGINT, sig_int) == SIG_ERR) {
++		fprintf(stderr, "can't set signal handler: %s\n", strerror(errno));
++		goto cleanup;
++	}
++
++    printf("Please run `sudo cat /sys/kernel/debug/tracing/trace_pipe` "
++	       "to see output of the BPF programs.\n");
++
++    while (!stop) {
++        fprintf(stderr, ".");
++        sleep(1);
++    }
++
++	int count = 0;
++	printf("\nprint map\n");
++	while (bpf_map_get_next_key(map_fd, &key, &next_key) == 0) {
++		bpf_map_lookup_elem(map_fd, &next_key, &val);
++		key = next_key;
++		printf("%5d:%016lx:%d\n", ++count, key, val);
++	}
++
++    cleanup:
++        // bpf_link__destroy(link);
++		for (j--; j >= 0; j--)
++			bpf_link__destroy(links[j]);
++	    bpf_object__close(obj);
++        return 0;
++
++
++
++
++    return 0;
++}
+\ No newline at end of file
+diff --git a/samples/ebpf/Makefile b/samples/ebpf/Makefile
+new file mode 100644
+index 000000000..eb47e747f
+--- /dev/null
++++ b/samples/ebpf/Makefile
+@@ -0,0 +1,271 @@
++# SPDX-License-Identifier: GPL-2.0
++
++BPF_SAMPLES_PATH ?= $(abspath $(srctree)/$(src))
++TOOLS_PATH := $(BPF_SAMPLES_PATH)/../../tools
++
++# List of programs to build
++# tprogs-y += tracex4
++# tprogs-y += tracex6
++tprogs-y += kmalloc_ret
++# tprogs-y += kmalloc_track
++
++
++
++# Libbpf dependencies
++LIBBPF = $(TOOLS_PATH)/lib/bpf/libbpf.a
++
++CGROUP_HELPERS := ../../tools/testing/selftests/bpf/cgroup_helpers.o
++TRACE_HELPERS := ../../tools/testing/selftests/bpf/trace_helpers.o
++
++
++
++# tracex4-objs := tracex4_user.o
++# tracex6-objs := tracex6_user.o
++kmalloc_ret-objs := kmalloc_ret.o 
++# kmalloc_track-objs := kmalloc_track.o
++
++# Tell kbuild to always build the programs
++always-y := $(tprogs-y)
++always-y += tracex4_kern.o
++always-y += tracex6_kern.o
++always-y += kmalloc_ret.bpf.o
++
++
++ifeq ($(ARCH), arm)
++# Strip all except -D__LINUX_ARM_ARCH__ option needed to handle linux
++# headers when arm instruction set identification is requested.
++ARM_ARCH_SELECTOR := $(filter -D__LINUX_ARM_ARCH__%, $(KBUILD_CFLAGS))
++BPF_EXTRA_CFLAGS := $(ARM_ARCH_SELECTOR)
++TPROGS_CFLAGS += $(ARM_ARCH_SELECTOR)
++endif
++
++ifeq ($(ARCH), mips)
++TPROGS_CFLAGS += -D__SANE_USERSPACE_TYPES__
++ifdef CONFIG_MACH_LOONGSON64
++BPF_EXTRA_CFLAGS += -I$(srctree)/arch/mips/include/asm/mach-loongson64
++BPF_EXTRA_CFLAGS += -I$(srctree)/arch/mips/include/asm/mach-generic
++endif
++endif
++
++TPROGS_CFLAGS += -Wall -O2
++# TPROGS_CFLAGS += -w -O2
++TPROGS_CFLAGS += -Wmissing-prototypes
++TPROGS_CFLAGS += -Wstrict-prototypes
++
++TPROGS_CFLAGS += -I$(objtree)/usr/include
++TPROGS_CFLAGS += -I$(srctree)/tools/testing/selftests/bpf/
++TPROGS_CFLAGS += -I$(srctree)/tools/lib/
++TPROGS_CFLAGS += -I$(srctree)/tools/include
++TPROGS_CFLAGS += -I$(srctree)/tools/perf
++TPROGS_CFLAGS += -DHAVE_ATTR_TEST=0
++
++ifdef SYSROOT
++TPROGS_CFLAGS += --sysroot=$(SYSROOT)
++TPROGS_LDFLAGS := -L$(SYSROOT)/usr/lib
++endif
++
++TPROGS_LDLIBS			+= $(LIBBPF) -lelf -lz
++TPROGLDLIBS_tracex4		+= -lrt
++TPROGLDLIBS_trace_output	+= -lrt
++TPROGLDLIBS_map_perf_test	+= -lrt
++TPROGLDLIBS_test_overhead	+= -lrt
++# TPROGLDLIBS_xdpsock		+= -pthread -lcap
++# TPROGLDLIBS_xsk_fwd		+= -pthread
++
++# Allows pointing LLC/CLANG to a LLVM backend with bpf support, redefine on cmdline:
++# make M=samples/bpf LLC=~/git/llvm-project/llvm/build/bin/llc CLANG=~/git/llvm-project/llvm/build/bin/clang
++LLC ?= llc
++CLANG ?= clang
++OPT ?= opt
++LLVM_DIS ?= llvm-dis
++LLVM_OBJCOPY ?= llvm-objcopy
++BTF_PAHOLE ?= pahole
++
++# Detect that we're cross compiling and use the cross compiler
++ifdef CROSS_COMPILE
++CLANG_ARCH_ARGS = --target=$(notdir $(CROSS_COMPILE:%-=%))
++endif
++
++# Don't evaluate probes and warnings if we need to run make recursively
++ifneq ($(src),)
++HDR_PROBE := $(shell printf "\#include <linux/types.h>\n struct list_head { int a; }; int main() { return 0; }" | \
++	$(CC) $(TPROGS_CFLAGS) $(TPROGS_LDFLAGS) -x c - \
++	-o /dev/null 2>/dev/null && echo okay)
++
++ifeq ($(HDR_PROBE),)
++$(warning WARNING: Detected possible issues with include path.)
++$(warning WARNING: Please install kernel headers locally (make headers_install).)
++endif
++
++BTF_LLC_PROBE := $(shell $(LLC) -march=bpf -mattr=help 2>&1 | grep dwarfris)
++BTF_PAHOLE_PROBE := $(shell $(BTF_PAHOLE) --help 2>&1 | grep BTF)
++BTF_OBJCOPY_PROBE := $(shell $(LLVM_OBJCOPY) --help 2>&1 | grep -i 'usage.*llvm')
++BTF_LLVM_PROBE := $(shell echo "int main() { return 0; }" | \
++			  $(CLANG) -target bpf -O2 -g -c -x c - -o ./llvm_btf_verify.o; \
++			  readelf -S ./llvm_btf_verify.o | grep BTF; \
++			  /bin/rm -f ./llvm_btf_verify.o)
++
++BPF_EXTRA_CFLAGS += -fno-stack-protector
++ifneq ($(BTF_LLVM_PROBE),)
++	BPF_EXTRA_CFLAGS += -g
++else
++ifneq ($(and $(BTF_LLC_PROBE),$(BTF_PAHOLE_PROBE),$(BTF_OBJCOPY_PROBE)),)
++	BPF_EXTRA_CFLAGS += -g
++	LLC_FLAGS += -mattr=dwarfris
++	DWARF2BTF = y
++endif
++endif
++endif
++
++# Trick to allow make to be run from this directory
++all:
++	$(MAKE) -C ../../ M=$(CURDIR) BPF_SAMPLES_PATH=$(CURDIR)
++
++clean:
++	$(MAKE) -C ../../ M=$(CURDIR) clean
++	@find $(CURDIR) -type f -name '*~' -delete
++
++$(LIBBPF): FORCE
++# Fix up variables inherited from Kbuild that tools/ build system won't like
++	$(MAKE) -C $(dir $@) RM='rm -rf' EXTRA_CFLAGS="$(TPROGS_CFLAGS)" \
++		LDFLAGS=$(TPROGS_LDFLAGS) srctree=$(BPF_SAMPLES_PATH)/../../ O=
++
++BPFTOOLDIR := $(TOOLS_PATH)/bpf/bpftool
++BPFTOOL := $(BPFTOOLDIR)/bpftool
++$(BPFTOOL): $(wildcard $(BPFTOOLDIR)/*.[ch] $(BPFTOOLDIR)/Makefile)
++	    $(MAKE) -C $(BPFTOOLDIR) srctree=$(BPF_SAMPLES_PATH)/../../
++
++$(obj)/syscall_nrs.h:	$(obj)/syscall_nrs.s FORCE
++	$(call filechk,offsets,__SYSCALL_NRS_H__)
++
++targets += syscall_nrs.s
++clean-files += syscall_nrs.h
++
++FORCE:
++
++
++# Verify LLVM compiler tools are available and bpf target is supported by llc
++.PHONY: verify_cmds verify_target_bpf $(CLANG) $(LLC)
++
++verify_cmds: $(CLANG) $(LLC)
++	@for TOOL in $^ ; do \
++		if ! (which -- "$${TOOL}" > /dev/null 2>&1); then \
++			echo "*** ERROR: Cannot find LLVM tool $${TOOL}" ;\
++			exit 1; \
++		else true; fi; \
++	done
++
++verify_target_bpf: verify_cmds
++	@if ! (${LLC} -march=bpf -mattr=help > /dev/null 2>&1); then \
++		echo "*** ERROR: LLVM (${LLC}) does not support 'bpf' target" ;\
++		echo "   NOTICE: LLVM version >= 3.7.1 required" ;\
++		exit 2; \
++	else true; fi
++
++$(BPF_SAMPLES_PATH)/*.c: verify_target_bpf $(LIBBPF)
++$(src)/*.c: verify_target_bpf $(LIBBPF)
++
++
++# $(obj)/kmalloc_ret.o: $(obj)/kmalloc_ret.skel.h
++# $(obj)/kmalloc_track.o: $(obj)/kmalloc_track.skel.h
++
++
++
++
++-include $(BPF_SAMPLES_PATH)/Makefile.target
++
++VMLINUX_BTF_PATHS ?= $(abspath $(if $(O),$(O)/vmlinux))				\
++		     $(abspath $(if $(KBUILD_OUTPUT),$(KBUILD_OUTPUT)/vmlinux))	\
++		     $(abspath ./vmlinux)
++VMLINUX_BTF ?= $(abspath $(firstword $(wildcard $(VMLINUX_BTF_PATHS))))
++
++$(obj)/vmlinux.h: $(VMLINUX_BTF) $(BPFTOOL)
++ifeq ($(VMLINUX_H),)
++	$(Q)$(BPFTOOL) btf dump file $(VMLINUX_BTF) format c > $@
++else
++	$(Q)cp "$(VMLINUX_H)" $@
++endif
++
++ifeq ($(VMLINUX_BTF),)
++	$(error Cannot find a vmlinux for VMLINUX_BTF at any of "$(VMLINUX_BTF_PATHS)",\
++		build the kernel or set VMLINUX_BTF variable)
++endif
++
++clean-files += vmlinux.h
++
++# Get Clang's default includes on this system, as opposed to those seen by
++# '-target bpf'. This fixes "missing" files on some architectures/distros,
++# such as asm/byteorder.h, asm/socket.h, asm/sockios.h, sys/cdefs.h etc.
++#
++# Use '-idirafter': Don't interfere with include mechanics except where the
++# build would have failed anyways.
++define get_sys_includes
++$(shell $(1) -v -E - </dev/null 2>&1 \
++        | sed -n '/<...> search starts here:/,/End of search list./{ s| \(/.*\)|-idirafter \1|p }') \
++$(shell $(1) -dM -E - </dev/null | grep '#define __riscv_xlen ' | sed 's/#define /-D/' | sed 's/ /=/')
++endef
++
++CLANG_SYS_INCLUDES = $(call get_sys_includes,$(CLANG))
++
++
++
++# $(obj)/%.bpf.o: $(src)/%.bpf.c $(obj)/vmlinux.h $(src)/xdp_sample.bpf.h $(src)/xdp_sample_shared.h
++$(obj)/%.bpf.o: $(src)/%.bpf.c $(obj)/vmlinux.h 
++	@echo "  CLANG-BPF " $@
++	$(Q)$(CLANG) -g -O2 -target bpf -D__TARGET_ARCH_$(SRCARCH) \
++		-Wno-compare-distinct-pointer-types -I$(srctree)/include \
++		-I$(srctree)/samples/bpf -I$(srctree)/tools/include \
++		-I$(srctree)/tools/lib $(CLANG_SYS_INCLUDES) \
++		-c $(filter %.bpf.c,$^) -o $@
++
++
++# LINKED_SKELS := kmalloc_ret.skel.h, kmalloc_track.skel.h
++clean-files += $(LINKED_SKELS)
++
++
++# kmalloc_ret.skel.h-deps := kmalloc_ret.bpf.o
++# kmalloc_track.skel.h-deps := kmalloc_track.bpf.o
++
++
++
++
++LINKED_BPF_SRCS := $(patsubst %.bpf.o,%.bpf.c,$(foreach skel,$(LINKED_SKELS),$($(skel)-deps)))
++
++BPF_SRCS_LINKED := $(notdir $(wildcard $(src)/*.bpf.c))
++BPF_OBJS_LINKED := $(patsubst %.bpf.c,$(obj)/%.bpf.o, $(BPF_SRCS_LINKED))
++BPF_SKELS_LINKED := $(addprefix $(obj)/,$(LINKED_SKELS))
++
++$(BPF_SKELS_LINKED): $(BPF_OBJS_LINKED) $(BPFTOOL)
++	@echo "  BPF GEN-OBJ " $(@:.skel.h=)
++	$(Q)$(BPFTOOL) gen object $(@:.skel.h=.lbpf.o) $(addprefix $(obj)/,$($(@F)-deps))
++	@echo "  BPF GEN-SKEL" $(@:.skel.h=)
++	$(Q)$(BPFTOOL) gen skeleton $(@:.skel.h=.lbpf.o) name $(notdir $(@:.skel.h=)) > $@
++#  $(Q)$(BPFTOOL) gen skeleton $(@:.skel.h=.lbpf.o) name $(notdir $(@:.skel.h=)) > $@
++
++# asm/sysreg.h - inline assembly used by it is incompatible with llvm.
++# But, there is no easy way to fix it, so just exclude it since it is
++# useless for BPF samples.
++# below we use long chain of commands, clang | opt | llvm-dis | llc,
++# to generate final object file. 'clang' compiles the source into IR
++# with native target, e.g., x64, arm64, etc. 'opt' does bpf CORE IR builtin
++# processing (llvm12) and IR optimizations. 'llvm-dis' converts
++# 'opt' output to IR, and finally 'llc' generates bpf byte code.
++$(obj)/%.o: $(src)/%.c
++	@echo "  CLANG-bpf " $@
++	$(Q)$(CLANG) $(NOSTDINC_FLAGS) $(LINUXINCLUDE) $(BPF_EXTRA_CFLAGS) \
++		-I$(obj) -I$(srctree)/tools/testing/selftests/bpf/ \
++		-I$(srctree)/tools/lib/ \
++		-D__KERNEL__ -D__BPF_TRACING__ -Wno-unused-value -Wno-pointer-sign \
++		-D__TARGET_ARCH_$(SRCARCH) -Wno-compare-distinct-pointer-types \
++		-Wno-gnu-variable-sized-type-not-at-end \
++		-Wno-address-of-packed-member -Wno-tautological-compare \
++		-Wno-unknown-warning-option $(CLANG_ARCH_ARGS) \
++		-fno-asynchronous-unwind-tables \
++		-w -g \
++		-I$(srctree)/samples/bpf/ -include asm_goto_workaround.h \
++		-O2 -emit-llvm -Xclang -disable-llvm-passes -c $< -o - | \
++		$(OPT) -O2 -mtriple=bpf-pc-linux | $(LLVM_DIS) | \
++		$(LLC) -march=bpf $(LLC_FLAGS) -filetype=obj -o $@
++ifeq ($(DWARF2BTF),y)
++	$(BTF_PAHOLE) -J $@
++endif
+\ No newline at end of file
+diff --git a/samples/ebpf/kmalloc_ret.bpf.c b/samples/ebpf/kmalloc_ret.bpf.c
+new file mode 100644
+index 000000000..237d73524
+--- /dev/null
++++ b/samples/ebpf/kmalloc_ret.bpf.c
+@@ -0,0 +1,122 @@
++#include "vmlinux.h"
++#include <bpf/bpf_helpers.h>
++#include <bpf/bpf_tracing.h>
++#include <bpf/bpf_core_read.h>
++// #include <linux/gfp.h>
++// #include <linux/slab.h>
++#define ___GFP_IO		0x40u
++#define ___GFP_FS		0x80u
++#define __GFP_IO	(___GFP_IO)
++#define __GFP_FS	(___GFP_FS)
++
++// #define GFP_KERNEL	(__GFP_RECLAIM | __GFP_IO | __GFP_FS)
++#define GFP_KERNEL	(__GFP_IO | __GFP_FS)
++char LICENSE[] SEC("license") = "Dual BSD/GPL";
++
++struct {
++    __uint(type, BPF_MAP_TYPE_HASH);
++    __uint(max_entries, 40960);
++    __type(key, u64);
++    __type(value, u64);
++} kmalloc_hash SEC(".maps");
++
++// int replace = 0;
++
++SEC("kprobe/__kmalloc")
++int BPF_KPROBE(kmalloc_ret)
++{
++    u32 alloc_bytes = (u32) ctx->di;
++    u64 val = 1;
++    u64 key = 0;
++    int err = 0;
++    if (alloc_bytes > 512) {
++        bpf_printk("kmalloc params %d, %d, %d\n", ctx->di, ctx->si, bpf_get_current_pid_tgid()>>32);
++        unsigned long *new = (unsigned long*) bpf_kmalloc((u32)ctx->di, GFP_KERNEL);
++        bpf_printk("new : %lx\n", new);
++        // bpf_printk("free : %d\n", bpf_kfree((void*)new));
++        key = (u64) new;
++        err = bpf_map_update_elem(&kmalloc_hash, &key, &val, BPF_NOEXIST);
++        if (err < 0) {
++            bpf_printk("%d:kmalloc exist in hash %lx\n", err, new);
++            return err;
++        }
++
++        bpf_printk("kmalloc replace %d\n", bpf_override_return(ctx, new));
++        // replace = 0;
++    }
++    
++    return 0;
++}
++
++SEC("kprobe/kfree")
++int BPF_KPROBE(kmalloc_ret_free)
++{
++    u64 *pval = NULL;
++    u64 key = (u64) ctx->di;
++    int err = 0;
++    pval = bpf_map_lookup_elem(&kmalloc_hash, &key);
++    if (pval == NULL) {
++        return 0;
++    } else {
++        bpf_printk("kfree params %lx, %d, %d\n", key, *pval, bpf_get_current_pid_tgid()>>32);
++        bpf_kfree((void*) key);
++        err = bpf_map_delete_elem(&kmalloc_hash, &key);
++        if (err < 0) {
++            bpf_printk("%d:kfree delete failed %lx\n", err, key);
++            return err;
++        } 
++        bpf_printk("kfree replace %d\n", bpf_override_return(ctx, 0));
++    }
++}
++
++
++// SEC("kretprobe/__kmalloc")
++// int BPF_RETKPROBE(kmalloc_ret1)
++// {
++//     unsigned long alloc_bytes = (unsigned long) ctx->di;
++//     unsigned long ret = (unsigned long) ctx->ax;
++//     if (alloc_bytes > 2048) {
++//         bpf_printk("return %lx, %d\n", ctx->ax, bpf_get_current_pid_tgid()>>32);
++//     }
++    
++//     return 0;
++// }
++
++
++// SEC("tracepoint/kmem/kmalloc")
++// int handle_tp(struct trace_event_raw_kmem_alloc* ctx)
++// {
++//     // bpf_printk("%016lx: %016lx\n", ctx->call_site, (unsigned long)ctx->ptr);
++//     u64 *pval = NULL, val = 0;
++//     struct pt_regs *regs;
++//     u64 key = (u64) ctx->bytes_alloc;
++//     u64 *ptr = (u64*) ctx->ptr;
++//     // int parent, pid = 0;
++
++//     int err = 0;
++    
++//     pval = bpf_map_lookup_elem(&kmalloc_count, &key);
++//     if (pval == NULL) {
++//         val = 0;
++//     } else {
++//         val = *pval;
++//     }
++//     val += 1;
++//     bpf_map_update_elem(&kmalloc_count, &key, &val, BPF_ANY);
++//     return 0;
++// }
++
++// cat /sys/kernel/debug/tracing/events/kmem/kmalloc/format 
++// name: kmalloc
++// ID: 533
++// format:
++//         field:unsigned short common_type;       offset:0;       size:2; signed:0;
++//         field:unsigned char common_flags;       offset:2;       size:1; signed:0;
++//         field:unsigned char common_preempt_count;       offset:3;       size:1; signed:0;
++//         field:int common_pid;   offset:4;       size:4; signed:1;
++
++//         field:unsigned long call_site;  offset:8;       size:8; signed:0;
++//         field:const void * ptr; offset:16;      size:8; signed:0;
++//         field:size_t bytes_req; offset:24;      size:8; signed:0;
++//         field:size_t bytes_alloc;       offset:32;      size:8; signed:0;
++//         field:gfp_t gfp_flags;  offset:40;      size:4; signed:0;
+diff --git a/samples/ebpf/kmalloc_ret.c b/samples/ebpf/kmalloc_ret.c
+new file mode 100644
+index 000000000..73ac5dcce
+--- /dev/null
++++ b/samples/ebpf/kmalloc_ret.c
+@@ -0,0 +1,152 @@
++#include <stdio.h>
++#include <unistd.h>
++#include <signal.h>
++#include <string.h>
++#include <errno.h>
++#include <sys/resource.h>
++#include <bpf/libbpf.h>
++// #include "kmalloc_ret.skel.h"
++
++static int libbpf_print_fn(enum libbpf_print_level level, const char *format, va_list args)
++{
++	return vfprintf(stderr, format, args);
++}
++
++static volatile sig_atomic_t stop;
++
++static void sig_int(int signo)
++{
++	stop = 1;
++}
++
++// int main(int argc, char **argv)
++// {
++//     struct kmalloc_ret *skel;
++//     int err;
++
++//     libbpf_set_strict_mode(LIBBPF_STRICT_ALL);
++
++//     libbpf_set_print(libbpf_print_fn);
++
++//     skel = kmalloc_ret__open_and_load();
++//     if (!skel) {
++// 		fprintf(stderr, "Failed to open BPF skeleton\n");
++// 		return 1;
++// 	}
++
++//     err = kmalloc_ret__attach(skel);
++
++//     if (err) {
++// 		fprintf(stderr, "Failed to attach BPF skeleton\n");
++// 		goto cleanup;
++// 	}
++
++//     // skel->maps.kmalloc_count;
++
++// 	if (signal(SIGINT, sig_int) == SIG_ERR) {
++// 		fprintf(stderr, "can't set signal handler: %s\n", strerror(errno));
++// 		goto cleanup;
++// 	}
++
++// 	printf("Please run `sudo cat /sys/kernel/debug/tracing/trace_pipe` "
++// 	       "to see output of the BPF programs.\n");
++
++//     while (!stop) {
++//         fprintf(stderr, ".");
++//         sleep(1);
++//     }
++
++//     cleanup:
++//         kmalloc_ret__destroy(skel);
++//         return -err;
++// }
++
++
++
++
++
++int main(int argc, char **argv)
++{
++    struct bpf_link *links[2];
++	struct bpf_program *prog;
++	struct bpf_object *obj;
++	char filename[256];
++	int map_fd, i, j = 0;
++	__u64 key, next_key, val;
++
++    snprintf(filename, sizeof(filename), "%s.bpf.o", argv[0]);
++	
++	obj = bpf_object__open_file(filename, NULL);
++	if (libbpf_get_error(obj)) {
++		fprintf(stderr, "ERROR: opening BPF object file failed\n");
++		return 0;
++	}
++
++	/* load BPF program */
++	if (bpf_object__load(obj)) {
++		fprintf(stderr, "ERROR: loading BPF object file failed\n");
++		goto cleanup;
++	}
++
++	// prog = bpf_object__find_program_by_name(obj, "kmalloc_ret");
++	// if (!prog) {
++	// 	fprintf(stderr, "ERROR: finding a prog in obj file failed\n");
++	// 	goto cleanup;
++	// }
++
++    // link = bpf_program__attach(prog);
++	// if (libbpf_get_error(link)) {
++	// 	fprintf(stderr, "ERROR: bpf_program__attach failed\n");
++	// 	link = NULL;
++	// 	goto cleanup;
++	// }
++
++	map_fd = bpf_object__find_map_fd_by_name(obj, "kmalloc_hash");
++	if (map_fd < 0) {
++		fprintf(stderr, "ERROR: finding a map in obj file failed\n");
++		goto cleanup;
++	}
++
++	bpf_object__for_each_program(prog, obj) {
++		links[j] = bpf_program__attach(prog);
++		if (libbpf_get_error(links[j])) {
++			fprintf(stderr, "ERROR: bpf_program__attach failed\n");
++			links[j] = NULL;
++			goto cleanup;
++		}
++		j++;
++	}
++
++	if (signal(SIGINT, sig_int) == SIG_ERR) {
++		fprintf(stderr, "can't set signal handler: %s\n", strerror(errno));
++		goto cleanup;
++	}
++
++    printf("Please run `sudo cat /sys/kernel/debug/tracing/trace_pipe` "
++	       "to see output of the BPF programs.\n");
++
++    while (!stop) {
++        fprintf(stderr, ".");
++        sleep(1);
++    }
++
++	int count = 0;
++	printf("\nprint map\n");
++	while (bpf_map_get_next_key(map_fd, &key, &next_key) == 0) {
++		bpf_map_lookup_elem(map_fd, &next_key, &val);
++		key = next_key;
++		printf("%5d:%016lx:%d\n", ++count, key, val);
++	}
++
++    cleanup:
++        // bpf_link__destroy(link);
++		for (j--; j >= 0; j--)
++			bpf_link__destroy(links[j]);
++	    bpf_object__close(obj);
++        return 0;
++
++
++
++
++    return 0;
++}
+\ No newline at end of file
+diff --git a/tools/include/uapi/linux/bpf.h b/tools/include/uapi/linux/bpf.h
+index 791f31dd0..86550312e 100644
+--- a/tools/include/uapi/linux/bpf.h
++++ b/tools/include/uapi/linux/bpf.h
+@@ -4877,6 +4877,18 @@ union bpf_attr {
+  *		Get the struct pt_regs associated with **task**.
+  *	Return
+  *		A pointer to struct pt_regs.
++ *
++ * long bpf_kmalloc(u64 size, u32 flag)
++ *	Description
++ *		kmalloc wrapper.
++ *	Return
++ *		allocated memory address.
++ *
++ * int bpf_kfree(void *x)
++ *	Description
++ *		kfree wrapper.
++ *	Return
++ *		0.
+  */
+ #define __BPF_FUNC_MAPPER(FN)		\
+ 	FN(unspec),			\
+@@ -5055,6 +5067,8 @@ union bpf_attr {
+ 	FN(get_func_ip),		\
+ 	FN(get_attach_cookie),		\
+ 	FN(task_pt_regs),		\
++	FN(kmalloc),		\
++	FN(kfree),			\
+ 	/* */
+ 
+ /* integer value in 'imm' field of BPF_CALL instruction selects which helper
+-- 
+2.32.0
+
