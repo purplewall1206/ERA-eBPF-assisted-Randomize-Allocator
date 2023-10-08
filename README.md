@@ -1,5 +1,22 @@
 # ERA-eBPF-assisted-Randomize-Allocator
 
+cite:
+```
+@Article{1,
+title = {基于eBPF的内核堆漏洞动态缓解机制},
+author = {王子成,郭迎港,钟炳南,陈越琦,曾庆凯},
+ journal = {软件学报},
+ volume = {},
+ number = {},
+ pages = {1},
+ numpages = {},
+ year = {},
+ month = {},
+ doi = {10.13328/j.cnki.jos.006923},
+ publisher = {科学出版社}
+}
+```
+
 Kernel heap vulnerability is one of the main threats to operating system security today. 
 
 User-space attackers can leak or modify sensitive kernel information, disrupt kernel control flow, and even gain root privilege by triggering a vulnerability. 
