@@ -21,8 +21,9 @@ void *__kmalloc(size_t size, gfp_t flags)
 }
 EXPORT_SYMBOL(__kmalloc);
 ALLOW_ERROR_INJECTION(__kmalloc, NONE);
+// use error injection to skip this function
 
-
+// must!!! to prevent deadlock caused by eBPF helper function
 void *secure_kmalloc(size_t size, gfp_t flags)
 {
 	struct kmem_cache *s;
@@ -79,7 +80,9 @@ void kfree(const void *x)
 }
 EXPORT_SYMBOL(kfree);
 ALLOW_ERROR_INJECTION(kfree, NONE);
+// use error injection to skip this function
 
+// must!!! to prevent deadlock caused by eBPF helper function
 void secure_kfree(void* x)
 {
 	struct page *page;
